@@ -380,3 +380,15 @@ These provide ~10x faster compression than numpy and enable fused compressed dec
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Built With
+
+This project was entirely **vibe coded** with [Claude Code](https://claude.ai/code) (Anthropic's Claude Opus 4.6) in a single session — from initial concept to working production compression with mathematical proofs, A/B benchmarks, and stress tests.
+
+The entire development process — debugging CUDA conflicts on GB10, discovering the sqrt(D) scaling fix, implementing CPU-side numpy compression, writing the 10-test proof suite, running 130+ live requests, and generating this documentation — was done collaboratively with Claude Code as the AI pair programmer.
+
+Tools used:
+- **[Claude Code](https://claude.ai/code)** — AI pair programmer (Anthropic Claude Opus 4.6, 1M context)
+- **[vLLM](https://github.com/vllm-project/vllm)** v0.17 — LLM inference engine
+- **[NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)** — GB10 GPU with 121GB unified memory
+- **numpy** — All compression runs on CPU via numpy (no CUDA kernels on GB10)
