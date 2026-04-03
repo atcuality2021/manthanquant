@@ -297,7 +297,7 @@ GPU tensor (bf16) -> .float().cpu().numpy() -> Lloyd-Max encode -> numpy arrays
 |---------|--------|-------------|
 | v0.3 | **Current** | Shadow cache with 5.12x compression, 25-user concurrency, stress-tested |
 | v0.4 | Next | Hot/cold LRU eviction -- compress idle sessions, free bf16 blocks, decompress on return. Target: 5x more concurrent sessions. |
-| v0.5 | Planned | x86 discrete GPU support (separate repo) -- CUDA kernels for RTX 6000/4070/A100 |
+| v0.5 | **Done** | x86 discrete GPU support -- [manthanquant-x86](https://github.com/atcuality2021/manthanquant-x86) with CUDA kernels (20x faster), tested on RTX 6000 Blackwell |
 | v1.0 | Planned | Production-ready with compressed decode, memory savings, and multi-GPU support |
 
 ## Tested On
@@ -338,21 +338,61 @@ manthanquant/
 
 ## Real-World Impact: Concurrent User Scaling
 
-Measured on NVIDIA DGX Spark GB10 with Qwen3.5-35B-A3B and ManthanQuant active:
+Measured on NVIDIA DGX Spark GB10 with Qwen3.5-35B-A3B and ManthanQuant active (April 2026, 200 tok/user):
 
-| Concurrent Users | Aggregate tok/s | Per-user tok/s |
-|-----------------|-----------------|----------------|
-| 1 | 21.8 | 21.8 |
-| 4 | 83.3 | 20.8 |
-| 8 | 134.5 | 16.8 |
-| 15 | 126.8 | 8.5 |
-| 25 | 111.0 | 4.4 |
+| Concurrent Users | Aggregate tok/s | Per-user tok/s | Wall Time | Errors |
+|-----------------|-----------------|----------------|-----------|--------|
+| 1 | 21.7 | **21.7** | 9.2s | 0 |
+| 2 | 38.2 | **19.1** | 10.4s | 0 |
+| 4 | 61.1 | **15.2** | 13.1s | 0 |
+| 6 | 82.7 | **13.7** | 14.5s | 0 |
+| **8** | **101.3** | **12.6** | **15.8s** | **0** |
+| 10 | 75.6 | 7.5 | 26.4s | 0 |
+| 15 | 95.7 | 6.3 | 31.3s | 0 |
+| 20 | 88.5 | 4.4 | 45.1s | 0 |
+
+**Sweet spot: 8 concurrent users** -- 101 agg tok/s, 12.6 tok/s per user, 0 errors.
+
+### Per-User Token Budget
+
+| Users | Per-user tok/s | Time for 100 tok | Time for 500 tok | Time for 1000 tok |
+|-------|----------------|-----------------|-----------------|------------------|
+| 1 | 21.7 | 4.6s | 23s | 46s |
+| 4 | 15.2 | 6.6s | 33s | 66s |
+| 8 | 12.6 | 7.9s | 40s | 79s |
+| 15 | 6.3 | 15.9s | 79s | 159s |
 
 **The bottleneck is KV memory, not compute.** With ManthanQuant hot/cold LRU (v0.4 roadmap):
 - **Active users**: Full bf16 KV, ~22 tok/s per user
 - **Idle users**: Compressed to 3-bit shadow cache (5.12x smaller)
 - **Returning users**: 1-2s decompress latency, then full speed
 - **Capacity increase**: 5.12x more idle sessions in the same memory
+
+## Cross-Cluster: GB10 vs RTX 6000
+
+Both running Qwen3.5-35B-A3B with ManthanQuant KV compression (3-bit, 5.12x ratio).
+
+| Spec | GB10 (this repo) | RTX 6000 ([x86 repo](https://github.com/atcuality2021/manthanquant-x86)) |
+|------|-----------------|---------|
+| GPU | DGX Spark GB10 (128 GB unified) | RTX PRO 6000 Blackwell (96 GB discrete) |
+| Arch | aarch64 (ARM) | x86_64 |
+| Compression | numpy on ARM CPU | CUDA kernels on GPU |
+| Encode speed | numpy (~22 tok/s) | **331M vec/s (CUDA)** |
+| vLLM | v0.17 | v0.19 |
+
+### Throughput Comparison
+
+| Test | GB10 (tok/s) | RTX 6000 (tok/s) | Delta |
+|------|-------------|------------------|-------|
+| Math | 21.4 | **31.6** | +48% |
+| Code Generation | 22.1 | **32.2** | +46% |
+| Reasoning | 21.7 | **32.0** | +47% |
+| Summarization | 22.1 | **31.6** | +43% |
+| Long (1000 tok) | 22.3 | **31.6** | +42% |
+| Multi-turn (3-turn) | 21.9 | **31.1** | +42% |
+| **Average** | **21.9** | **32.0** | **+46%** |
+
+The x86 version with CUDA kernels is **46% faster** on average. See the [manthanquant-x86](https://github.com/atcuality2021/manthanquant-x86) repo for full RTX 6000 benchmarks and CUDA kernel details.
 
 ## Credits & References
 
@@ -391,3 +431,7 @@ Tools used:
 - **[vLLM](https://github.com/vllm-project/vllm)** v0.17 -- LLM inference engine
 - **[NVIDIA DGX Spark](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)** -- GB10 GPU with 128GB unified memory
 - **numpy** -- All compression runs on CPU via numpy (no CUDA kernels on GB10)
+
+## See Also
+
+- **[manthanquant-x86](https://github.com/atcuality2021/manthanquant-x86)** -- CUDA-accelerated version for x86 discrete GPUs (RTX 6000, RTX 4090, A100, H100). 20x faster encode via fused CUDA kernels, 46% higher throughput than GB10.
