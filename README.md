@@ -1,23 +1,30 @@
 # ManthanQuant
 
-**3-bit KV Cache Compression for LLM Inference on NVIDIA DGX Spark GB10**
+**3-bit KV Cache Compression for LLM Inference — GB10 + x86 Discrete GPUs**
 
-![Python 3.12](https://img.shields.io/badge/python-3.12-blue)
-![vLLM 0.17](https://img.shields.io/badge/vLLM-0.17-green)
+![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue)
+![vLLM 0.17-0.19](https://img.shields.io/badge/vLLM-0.17--0.19-green)
 ![NVIDIA GB10](https://img.shields.io/badge/NVIDIA-GB10-76b900)
+![NVIDIA RTX 6000](https://img.shields.io/badge/NVIDIA-RTX%206000-76b900)
 ![License MIT](https://img.shields.io/badge/license-MIT-lightgrey)
 
-Pure numpy 3-bit Lloyd-Max KV cache compression that runs on ARM CPU cores. Achieves **5.12x compression ratio** with **0.983 cosine similarity**. Designed for NVIDIA DGX Spark GB10's unified memory architecture where `.cpu()` is zero-cost -- the CPU and GPU share the same 121 GB physical RAM, so moving tensors to CPU for compression involves no data copy.
+3-bit Lloyd-Max KV cache compression with **dual-platform support**:
+- **GB10 (ARM unified memory)**: Pure numpy on CPU cores, zero-cost `.cpu()`, 5.12x compression
+- **x86 discrete GPUs (RTX 6000/4070/A100)**: Native CUDA kernels, 4.75x compression, **only 4% overhead**
+
+Auto-detects platform and selects the optimal backend.
 
 ## Key Numbers
 
-| Metric | Value |
-|--------|-------|
-| Compression ratio | 5.12x (512 B -> 100 B per 256-dim vector) |
-| Reconstruction quality | 0.983 cosine similarity |
-| Throughput overhead | 18% (27.8 vs 33.9 tok/s) |
-| Stability | 0 crashes across 130+ requests, 57,000+ tokens |
-| Mathematical proofs | 10/10 passing |
+| Metric | GB10 (ARM) | x86 (RTX 6000) |
+|--------|-----------|----------------|
+| Compression ratio | 5.12x | 4.75x |
+| Cosine similarity | 0.983 | 0.983 |
+| Throughput overhead | 18% | **4%** |
+| Throughput | 27.8 tok/s | 22.2 tok/s (vs 23 baseline) |
+| Backend | numpy (CPU) | CUDA kernels (GPU) |
+| Stability | 130+ requests, 0 crashes | 3,471+ tokens, 0 errors |
+| Mathematical proofs | 10/10 | 18/18 |
 
 ## How Compression Works
 
@@ -230,20 +237,21 @@ This is slower than a fused CUDA kernel would be (hence the 18% overhead), but i
 
 | Version | Status | Description |
 |---------|--------|-------------|
-| v0.3 | Current | Shadow cache with 5.12x compression, monitoring, stability proof |
-| v0.4 | Next | Hot/cold LRU eviction -- compress idle sessions to shadow cache, free bf16 blocks, decompress on return. Target: 5x more concurrent sessions. |
-| v0.5 | Planned | x86 discrete GPU support -- custom CUDA kernels (in `csrc/`) work on discrete GPUs with separate GPU/CPU memory. Fused compressed decode on GPU. |
+| v0.3 | Released | GB10 shadow cache with 5.12x compression, monitoring, stability proof |
+| v0.4 | **Current** | x86 discrete GPU support — native CUDA kernels (SM 8.9, 12.0), auto-platform detection, TritonAttention hooks, 4% overhead |
+| v0.5 | Next | Hot/cold LRU eviction — compress idle sessions, free bf16 blocks, decompress on return. Target: 5x more concurrent sessions. |
 | v1.0 | Planned | Production-ready with compressed decode, memory savings, and multi-GPU support |
 
 ## Tested On
 
-| Component | Details |
-|-----------|---------|
-| Hardware | NVIDIA DGX Spark GB10 (121 GB unified, ARM aarch64) |
-| Model | Qwen3.5-35B-A3B (MoE, 11 attention layers, 2 KV heads, 256 head_dim) |
-| vLLM | v0.17 with MTP speculative decoding |
-| Python | 3.12 |
-| Dependencies | numpy (compression), torch (tensor conversion) |
+| Component | GB10 | x86 Desktop |
+|-----------|------|-------------|
+| Hardware | NVIDIA DGX Spark GB10 (121 GB unified, ARM aarch64) | NVIDIA RTX PRO 6000 Blackwell (96 GB, SM 12.0) + RTX 4070 (12 GB, SM 8.9) |
+| Model | Qwen3.5-35B-A3B (MoE, 11 attn layers) | Gemma 4 31B-it (60 attn layers, heterogeneous heads) |
+| vLLM | v0.17 (FlashAttention backend) | v0.19 (TritonAttention backend) |
+| Python | 3.12 | 3.13 |
+| CUDA | 12.1 (GB10) | 12.8/12.9 (x86) |
+| Dependencies | numpy, torch | numpy, torch, CUDA toolkit (optional) |
 
 ## Example Output
 
@@ -296,23 +304,26 @@ python3 tests/test_baseline_extended.py
 ```
 manthanquant/
 ├── manthanquant/
-│   ├── __init__.py          # Package init (v0.3.0, imports cpu_quantize)
-│   ├── cpu_quantize.py      # Pure numpy Lloyd-Max encoder/decoder
-│   ├── vllm_patch.py        # vLLM integration hooks (KV capture, shadow cache)
-│   └── ops.py               # CUDA ops API (for x86 discrete GPUs, not used on GB10)
+│   ├── __init__.py          # v0.4.0 — platform detection, unified compress/decompress API
+│   ├── cpu_quantize.py      # Pure numpy Lloyd-Max encoder/decoder (GB10 path)
+│   ├── x86_quantize.py      # Vectorized PyTorch + CUDA _C encoder/decoder (x86 path)
+│   ├── vllm_patch.py        # vLLM hooks for GB10 (FlashAttention, deferred CPU compression)
+│   ├── vllm_patch_x86.py    # vLLM hooks for x86 (FlashAttention + TritonAttention, GPU compression)
+│   └── ops.py               # CUDA ops API (CompressedKV dataclass)
 ├── csrc/
-│   ├── bindings.cpp          # PyTorch C++ bindings
-│   ├── turboquant_kernel.cu  # Lloyd-Max CUDA kernel
-│   ├── qjl_kernel.cu         # QJL error correction kernel
-│   ├── fused_attention_kernel.cu  # Fused compressed attention kernel
-│   └── packing.cuh           # Bit-packing header
+│   ├── bindings.cpp          # PyTorch C++ bindings (tq_encode/tq_decode)
+│   ├── turboquant_kernel.cu  # Lloyd-Max CUDA kernel (SM 8.9, 12.0)
+│   ├── qjl_kernel.cu         # QJL error correction kernel (disabled on Ubuntu 25.10)
+│   ├── fused_attention_kernel.cu  # Fused compressed attention (disabled on Ubuntu 25.10)
+│   ├── packing.cuh           # Bit-packing header
+│   └── glibc_cuda_compat.h   # Ubuntu 25.10 glibc 2.42 workaround
 ├── tests/
 │   ├── test_compression_proof.py   # 10 mathematical proof tests
 │   ├── test_stress.py              # 67-request stress test
 │   └── test_baseline_extended.py   # Extended baseline benchmarks
-├── install_vllm_patch.py    # Source patcher for vLLM flash_attn.py
+├── install_vllm_patch.py    # Source patcher for vLLM flash_attn.py (GB10)
 ├── launch_manthanquant.sh   # Launch script for vLLM + ManthanQuant
-├── setup.py                 # Build config (CUDA extension for x86)
+├── setup.py                 # Build config (optional CUDA extension, platform-adaptive)
 ├── LICENSE                  # MIT
 └── README.md
 ```
@@ -368,14 +379,30 @@ What ManthanQuant contributes beyond existing research:
 
 6. **10-test Mathematical Proof Suite**: Verifiable proofs of compression ratio, centroid optimality, bit-packing correctness, quality bounds, scaling behavior, and edge cases.
 
-### x86 Discrete GPU Support (Coming Soon)
+### x86 Discrete GPU Support (v0.4)
 
-The `csrc/` directory contains CUDA kernels that work on discrete GPUs (tested on RTX 4070):
-- `turboquant_kernel.cu` — Lloyd-Max 3-bit encode/decode
-- `fused_attention_kernel.cu` — Compressed attention (skip decompress)
-- `qjl_kernel.cu` — QJL random projection for unbiased dot products
+Native CUDA kernels for x86 discrete GPUs, tested on RTX PRO 6000 Blackwell (SM 12.0) and RTX 4070 (SM 8.9):
 
-These provide ~10x faster compression than numpy and enable fused compressed decode (attention directly on 3-bit data). They are disabled on GB10 but will be available in v0.5 for x86 systems with discrete GPUs.
+- `turboquant_kernel.cu` — Lloyd-Max 3-bit encode/decode (162,000 calls/s)
+- `x86_quantize.py` — Vectorized PyTorch fallback (13,000 calls/s) when CUDA kernels unavailable
+- `vllm_patch_x86.py` — vLLM v1 hooks for both FlashAttention and TritonAttention backends
+
+**Platform auto-detection:**
+- `platform.machine()` selects ARM (numpy) vs x86 (CUDA/PyTorch) path
+- GPU SM capability check prevents loading kernels compiled for wrong architecture
+- Graceful fallback: CUDA kernels → PyTorch vectorized → numpy CPU
+
+**Benchmark (Gemma 4 31B on RTX 6000 Blackwell):**
+| Test | Tokens | Time | Tok/s |
+|------|--------|------|-------|
+| Multi-turn Coding (3 turns) | 1,300 | 59s | 22.0 |
+| Math Reasoning | 500 | 23s | 22.1 |
+| Multi-turn Debugging (2 turns) | 1,000 | 46s | 22.0 |
+| Long Context Analysis | 500 | 23s | 21.9 |
+| Concurrent (3 requests) | 171 | 5s | 32.8 |
+| **Total** | **3,471** | **155s** | **22.4** |
+
+**Note:** `fused_attention_kernel.cu` and `qjl_kernel.cu` are disabled on Ubuntu 25.10 due to glibc 2.42 math header conflicts (cospi/sinpi/rsqrt). The `glibc_cuda_compat.h` header patches the system `mathcalls.h` for `turboquant_kernel.cu` only. Fused compressed decode remains disabled — all decode uses standard vLLM attention.
 
 ## License
 
