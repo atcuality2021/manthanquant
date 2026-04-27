@@ -1,62 +1,138 @@
 """
-install_vllm_patch.py — Patch vLLM's FlashAttentionImpl for TurboQuant.
+install_vllm_patch.py — Patch vLLM attention backends for ManthanQuant TurboQuant.
 
 Modifies the installed vLLM source to call ManthanQuant hooks in
-do_kv_cache_update() and forward(). Works in ALL processes because
-the code is in the actual source file (not monkey-patching).
+do_kv_cache_update() and forward(). Works in ALL processes because the
+code is in the actual source file (not monkey-patching).
+
+Supported backends (auto-detected, only patched if the file exists):
+  - flash_attn   (FlashAttentionImpl)        — historical, used by ASR/Whisper
+  - triton_attn  (TritonAttentionImpl)       — gemma-4-* on GB10 (sm_121)
+  - flashinfer   (FlashInferImpl)            — Qwen3.5-* on GB10
+
+vLLM picks the backend per model based on architecture compatibility (e.g.
+gemma-4 hard-forces TRITON_ATTN at config.py:104 due to heterogeneous head
+dims). Patching all three backends ensures the manthanquant hooks fire
+regardless of vLLM's choice.
 
 Usage:
-    ~/vllm-env/bin/python3 install_vllm_patch.py          # install
-    ~/vllm-env/bin/python3 install_vllm_patch.py --revert  # revert
+    ~/vllm-env/bin/python3 install_vllm_patch.py                    # patch all
+    ~/vllm-env/bin/python3 install_vllm_patch.py --backend triton_attn
+    ~/vllm-env/bin/python3 install_vllm_patch.py --revert           # revert all
+    ~/vllm-env/bin/python3 install_vllm_patch.py --revert flash_attn
 
 Hooks:
-1. KV hook after reshape_and_cache_flash() — queues KV data for deferred compression
-2. Forward pre-hook — intercepts decode for fused compressed attention
-3. Forward post-hook — flushes deferred compression after prefill FlashAttention
+1. KV hook after reshape_and_cache_flash()/triton_reshape_and_cache_flash()
+   — queues KV data for deferred compression.
+2. Forward pre-hook — intercepts decode for fused compressed attention.
+3. Forward post-hook — disabled on GB10 (causes device-side asserts);
+   compression flushes from the next forward pass's pre-hook instead.
+
+Activity flags written to ~/logs/:
+  manthanquant_loaded.flag — appended at module import time. Proves the
+      patched file was IMPORTED. vLLM imports backends during registration
+      scan even when picking a different one, so this accumulating does NOT
+      prove compression is running.
+  manthanquant_active.flag — appended on FIRST KV-cache hook fire per process
+      (gated by a one-shot mutable cell). Empty file = compression genuinely
+      not running. This is the honest signal.
 """
 
 import os
 import sys
 import shutil
 import py_compile
+import glob
+from typing import Optional
 
 VLLM_ENV = os.path.expanduser("~/vllm-env")
-FA_PATH = os.path.join(VLLM_ENV, "lib/python3.12/site-packages/vllm/v1/attention/backends/flash_attn.py")
-FA_ORIG = FA_PATH + ".manthanquant_orig"
+BACKENDS_DIR = os.path.join(
+    VLLM_ENV, "lib/python3.12/site-packages/vllm/v1/attention/backends"
+)
 
-# ── Import block (top of file) ───────────────────────────────────────────
+
+# ── Backend registry ─────────────────────────────────────────────────────
+# Each entry describes one attention backend file we know how to patch.
+# `kv_marker` must be the exact prefix (including leading whitespace) of
+# the line where the backend writes K/V to the paged cache. The hook is
+# inserted on the line AFTER the closing paren of that call.
+
+BACKENDS = [
+    {
+        "name": "flash_attn",
+        "filename": "flash_attn.py",
+        "class_name": "FlashAttentionImpl",
+        "kv_marker": "        reshape_and_cache_flash(",
+    },
+    {
+        "name": "triton_attn",
+        "filename": "triton_attn.py",
+        "class_name": "TritonAttentionImpl",
+        "kv_marker": "        triton_reshape_and_cache_flash(",
+    },
+    {
+        "name": "flashinfer",
+        "filename": "flashinfer.py",
+        "class_name": "FlashInferImpl",
+        # FlashInfer's KV write is inside `if self.kv_sharing_target_layer_name is None:`
+        # — 12-space indent. Hook fires only when KV is actually written
+        # (skipping KV-sharing layers that reuse another layer's cache).
+        "kv_marker": "            torch.ops._C_cache_ops.reshape_and_cache_flash(",
+    },
+]
+
+
+# ── Hook bodies ──────────────────────────────────────────────────────────
+# Same text injected into all three backend files. They reference module-level
+# names (_MQ_ACTIVE, _mq_patch, _MQ_FIRST_HOOK, _mq_logdir, _mq_os) created
+# by IMPORT_BLOCK at the top of each file.
 
 IMPORT_BLOCK = '''
 # ── ManthanQuant TurboQuant KV Cache Compression ─────────────────────────
 # IMPORTANT: Do NOT import manthanquant._C here — loading custom CUDA
 # extensions at import time conflicts with Triton/FlashAttention on GB10.
 # Only import the pure-Python vllm_patch module (no CUDA kernels).
+#
+# Two flags written to ~/logs/:
+#   manthanquant_loaded.flag — appended at file import (this block).
+#       Proves the patched backend file was IMPORTED. vLLM imports
+#       backends during registration scan even when it ultimately picks
+#       a different backend, so this flag accumulating does NOT prove
+#       compression is running.
+#   manthanquant_active.flag — appended on FIRST KV-cache hook fire.
+#       Proves at least one forward pass routed through this backend AND
+#       the hook executed. This is the honest "manthanquant is running"
+#       signal.
 _MQ_ACTIVE = False
+_MQ_FIRST_HOOK = [True]  # mutable cell — gated first-fire flag write
 try:
     import manthanquant.vllm_patch as _mq_patch
     _MQ_ACTIVE = True
     import os as _mq_os
     _mq_logdir = _mq_os.path.expanduser("~/logs")
     _mq_os.makedirs(_mq_logdir, exist_ok=True)
-    with open(_mq_os.path.join(_mq_logdir, "manthanquant_active.flag"), "a") as _mq_f:
-        _mq_f.write("flash_attn loaded pid=" + str(_mq_os.getpid()) + "\\n")
+    with open(_mq_os.path.join(_mq_logdir, "manthanquant_loaded.flag"), "a") as _mq_f:
+        _mq_f.write(__name__ + " loaded pid=" + str(_mq_os.getpid()) + "\\n")
 except ImportError:
     pass
 # ── End ManthanQuant imports ─────────────────────────────────────────────
 '''
 
-# ── KV update hook (after reshape_and_cache_flash) ───────────────────────
-# Passes self, layer, key, value, kv_cache, slot_mapping to the hook.
-# The hook only QUEUES data — no CUDA kernels run here.
+# KV update hook — fires after each backend's reshape_and_cache_flash call.
+# First fire writes to manthanquant_active.flag (honest activation signal).
 
 KV_UPDATE_HOOK = '''
         # ManthanQuant: queue KV for deferred compression
         if _MQ_ACTIVE:
+            if _MQ_FIRST_HOOK[0]:
+                _MQ_FIRST_HOOK[0] = False
+                try:
+                    with open(_mq_os.path.join(_mq_logdir, "manthanquant_active.flag"), "a") as _mq_f:
+                        _mq_f.write("kv_hook_first " + __name__ + " pid=" + str(_mq_os.getpid()) + "\\n")
+                except Exception:
+                    pass
             _mq_patch._patched_kv_hook(self, layer, key, value, kv_cache, slot_mapping)
 '''
-
-# ── Forward pre-hook (start of forward) ──────────────────────────────────
-# Returns result if decode handled by compressed attention, None for prefill.
 
 FORWARD_PRE_HOOK = '''
         # ManthanQuant: intercept decode for fused compressed attention
@@ -68,35 +144,51 @@ FORWARD_PRE_HOOK = '''
                 return _mq_result
 '''
 
-# ── Forward post-hook (end of forward, before return) ────────────────────
-# Flushes deferred KV compression AFTER FlashAttention completes.
-
+# Forward post-hook is intentionally DISABLED on GB10 — inserting code before
+# return statements in forward() causes device-side asserts on unified memory.
+# Compression runs in the pre-hook of the next forward pass instead.
+# The constant is kept for documentation; the install() function never injects it.
 FORWARD_POST_HOOK = '''
-        # ManthanQuant: flush deferred KV compression after FlashAttention
+        # ManthanQuant: flush deferred KV compression after attention
         if _MQ_ACTIVE:
             _mq_layer_name = _mq_patch._get_layer_name(self)
             _mq_patch._patched_forward_post_hook(self, _mq_layer_name)
 '''
 
 
-def install():
-    """Install ManthanQuant hooks into vLLM's flash_attn.py."""
-    if not os.path.exists(FA_PATH):
-        print(f"ERROR: {FA_PATH} not found")
-        sys.exit(1)
+# ── Per-backend patch + revert ───────────────────────────────────────────
 
-    # Backup original
-    if not os.path.exists(FA_ORIG):
-        shutil.copy2(FA_PATH, FA_ORIG)
-        print(f"Backed up: {FA_ORIG}")
+
+def _backend_paths(backend: dict) -> tuple[str, str]:
+    """Return (file_path, original_backup_path) for a backend dict."""
+    file_path = os.path.join(BACKENDS_DIR, backend["filename"])
+    return file_path, file_path + ".manthanquant_orig"
+
+
+def _install_one(backend: dict) -> bool:
+    """Install ManthanQuant hooks into one backend file. Returns True on success."""
+    file_path, orig_path = _backend_paths(backend)
+    name = backend["name"]
+    class_name = backend["class_name"]
+    kv_marker = backend["kv_marker"]
+
+    if not os.path.exists(file_path):
+        print(f"[{name}] SKIP — {file_path} not found")
+        return False
+
+    # Backup original on first run; otherwise restore from backup so we always
+    # patch a clean source (idempotent re-install).
+    if not os.path.exists(orig_path):
+        shutil.copy2(file_path, orig_path)
+        print(f"[{name}] backed up: {orig_path}")
     else:
-        shutil.copy2(FA_ORIG, FA_PATH)
+        shutil.copy2(orig_path, file_path)
 
-    with open(FA_PATH) as f:
+    with open(file_path) as f:
         content = f.read()
     lines = content.split("\n")
 
-    # ── 1. Insert import block ───────────────────────────────────────────
+    # ── 1. Insert IMPORT_BLOCK above the first import statement ──────────
     insert_idx = 0
     for i, line in enumerate(lines):
         if line.startswith("import ") or line.startswith("from "):
@@ -105,15 +197,17 @@ def install():
 
     import_lines = IMPORT_BLOCK.strip().split("\n")
     lines = lines[:insert_idx] + import_lines + [""] + lines[insert_idx:]
-    print("Inserted import block")
 
-    # ── 2. Insert KV hook after reshape_and_cache_flash() ────────────────
+    # ── 2. Insert KV_UPDATE_HOOK after the KV write call ─────────────────
     content_joined = "\n".join(lines)
-    marker = "        reshape_and_cache_flash("
-    idx = content_joined.find(marker)
-    if idx >= 0:
+    idx = content_joined.find(kv_marker)
+    if idx < 0:
+        print(f"[{name}] WARNING — KV marker not found ({kv_marker!r}); skipping KV hook")
+    else:
+        # Walk forward to find the matching closing paren; insert AFTER its
+        # newline so the hook becomes the next statement.
         paren_count = 0
-        search_start = idx + len(marker)
+        search_start = idx + len(kv_marker)
         for ci in range(search_start, len(content_joined)):
             if content_joined[ci] == "(":
                 paren_count += 1
@@ -121,145 +215,118 @@ def install():
                 if paren_count == 0:
                     end_of_line = content_joined.find("\n", ci)
                     content_joined = (
-                        content_joined[:end_of_line + 1] +
-                        KV_UPDATE_HOOK +
-                        content_joined[end_of_line + 1:]
+                        content_joined[: end_of_line + 1]
+                        + KV_UPDATE_HOOK
+                        + content_joined[end_of_line + 1 :]
                     )
                     break
                 paren_count -= 1
-        print("Inserted KV update hook")
-    else:
-        print("WARNING: Could not find reshape_and_cache_flash marker")
 
-    # ── 3. Insert forward pre-hook (at start of forward body) ────────────
-    # Find 'assert output is not None' inside FlashAttentionImpl.forward()
-    # This is the first executable line after the docstring — reliable anchor.
     lines = content_joined.split("\n")
+
+    # ── 3. Insert FORWARD_PRE_HOOK just before the forward()'s first ──────
+    # 'assert output is not None' line inside the impl class. All three
+    # backends use this identical anchor at the top of forward().
     in_impl = False
+    inserted_pre = False
     for i, line in enumerate(lines):
-        if "class FlashAttentionImpl" in line:
+        if f"class {class_name}" in line:
             in_impl = True
         if in_impl and "assert output is not None" in line:
-            # Insert hook BEFORE this assert
             lines = lines[:i] + FORWARD_PRE_HOOK.split("\n") + lines[i:]
-            print(f"Inserted forward pre-hook at line {i}")
+            inserted_pre = True
             break
-    else:
-        print("WARNING: Could not find forward() body anchor (assert output is not None)")
+    if not inserted_pre:
+        print(f"[{name}] WARNING — forward() anchor not found; skipping pre-hook")
 
-    # ── 4. Insert forward post-hook before return output in forward() ──────
-    # The post-hook flushes deferred KV compression AFTER FlashAttention
-    # completes for each layer. This is critical — without it, _pending_kv
-    # is queued by the KV hook but never compressed into the shadow cache.
-    #
-    # Strategy: insert before ALL 'return output' lines inside forward()
-    # EXCEPT:
-    #   - 'return output.fill_(0)' (profiling)
-    #   - returns inside _forward_encoder_attention calls
-    #   - the ManthanQuant pre-hook return (_mq_result)
-    # Work backwards so line indices don't shift.
-    in_forward = False
-    forward_end = len(lines)
-    forward_start = 0
-    return_indices = []
-    in_impl = False
-
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if "class FlashAttentionImpl" in line:
-            in_impl = True
-        # forward() inside FlashAttentionImpl — the signature spans multiple lines
-        if in_impl and not in_forward and "    def forward(" in line:
-            in_forward = True
-            forward_start = i
-            continue
-        # Next method definition at same indent level = end of forward()
-        if in_forward and line.startswith("    def ") and "forward" not in line:
-            forward_end = i
-            break
-        if in_forward and "return output" in line:
-            # Skip profiling, encoder returns, and ManthanQuant pre-hook
-            if "return output.fill_" in line:
-                continue
-            if "_mq_result" in line:
-                continue
-            if "return self._forward_encoder" in line:
-                continue
-            return_indices.append(i)
-
-    # GB10: Post-hook disabled — inserting code before return statements
-    # causes CUDA device-side asserts on GB10 unified memory.
-    # Compression runs in the pre-hook of the next forward pass instead.
-    return_indices = []
-
-    post_hook_template = FORWARD_POST_HOOK.strip().split("\n")
-    base_indent = "        "  # 8 spaces — template's indent level
-    inserted = 0
-    for idx in reversed(return_indices):
-        # Detect the return line's indentation
-        return_line = lines[idx]
-        actual_indent = return_line[:len(return_line) - len(return_line.lstrip())]
-        # Re-indent the post-hook to match
-        adjusted = []
-        for pl in post_hook_template:
-            stripped_pl = pl.lstrip()
-            if not stripped_pl:
-                adjusted.append("")
-                continue
-            # Replace base indent with actual indent
-            old_indent = pl[:len(pl) - len(stripped_pl)]
-            extra = old_indent[len(base_indent):] if len(old_indent) >= len(base_indent) else ""
-            adjusted.append(actual_indent + extra + stripped_pl)
-        lines = lines[:idx] + adjusted + [""] + lines[idx:]
-        inserted += 1
-
-    # Post-hook disabled on GB10 — inserting code before return statements
-    # in forward() causes device-side asserts. Compression runs in the
-    # pre-hook of the next forward pass instead.
-    return_indices = []  # Override — don't insert post-hooks
-    inserted = 0
-    if inserted > 0:
-        print(f"Inserted forward post-hook before {inserted} return statement(s)")
-    else:
-        print("Post-hook skipped (GB10 compatibility)")
+    # ── 4. Forward post-hook intentionally skipped on GB10 (see comment above)
 
     # Write back
-    with open(FA_PATH, "w") as f:
+    with open(file_path, "w") as f:
         f.write("\n".join(lines))
 
-    # Verify syntax
+    # Verify syntax — auto-revert on compile error.
     try:
-        py_compile.compile(FA_PATH, doraise=True)
-        print("Syntax OK")
+        py_compile.compile(file_path, doraise=True)
     except py_compile.PyCompileError as e:
-        print(f"SYNTAX ERROR: {e}")
-        shutil.copy2(FA_ORIG, FA_PATH)
-        print("Reverted to original")
-        sys.exit(1)
+        print(f"[{name}] SYNTAX ERROR after patch: {e}")
+        shutil.copy2(orig_path, file_path)
+        print(f"[{name}] reverted to original")
+        return False
 
-    # Clear pycache
-    import glob
-    for pyc in glob.glob(os.path.join(os.path.dirname(FA_PATH), "__pycache__/flash_attn*.pyc")):
+    # Clear pyc cache so the next process loads our patched version.
+    pyc_glob = os.path.join(
+        os.path.dirname(file_path),
+        f"__pycache__/{backend['filename'].rsplit('.', 1)[0]}*.pyc",
+    )
+    for pyc in glob.glob(pyc_glob):
         os.remove(pyc)
-        print(f"Removed: {pyc}")
 
-    print("ManthanQuant TurboQuant patch installed successfully")
+    print(f"[{name}] OK")
+    return True
 
 
-def revert():
-    """Revert to original flash_attn.py."""
-    if os.path.exists(FA_ORIG):
-        shutil.copy2(FA_ORIG, FA_PATH)
-        import glob
-        for pyc in glob.glob(os.path.join(os.path.dirname(FA_PATH), "__pycache__/flash_attn*.pyc")):
-            os.remove(pyc)
-        print("Reverted to original")
-    else:
-        print("No backup found")
+def _revert_one(backend: dict) -> bool:
+    """Restore one backend file from its .manthanquant_orig backup."""
+    file_path, orig_path = _backend_paths(backend)
+    name = backend["name"]
+
+    if not os.path.exists(orig_path):
+        print(f"[{name}] no backup ({orig_path}) — nothing to revert")
+        return False
+
+    shutil.copy2(orig_path, file_path)
+    pyc_glob = os.path.join(
+        os.path.dirname(file_path),
+        f"__pycache__/{backend['filename'].rsplit('.', 1)[0]}*.pyc",
+    )
+    for pyc in glob.glob(pyc_glob):
+        os.remove(pyc)
+    print(f"[{name}] reverted")
+    return True
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+
+
+def _resolve_backends(name_filter: Optional[str]) -> list[dict]:
+    if not name_filter:
+        return BACKENDS
+    matches = [b for b in BACKENDS if b["name"] == name_filter]
+    if not matches:
+        valid = ", ".join(b["name"] for b in BACKENDS)
+        sys.exit(f"unknown backend {name_filter!r}; valid: {valid}")
+    return matches
+
+
+def install(name_filter: Optional[str] = None) -> int:
+    backends = _resolve_backends(name_filter)
+    failures = 0
+    for b in backends:
+        if not _install_one(b):
+            failures += 1
+    print(f"\nManthanQuant patch: {len(backends) - failures}/{len(backends)} backends OK")
+    return failures
+
+
+def revert(name_filter: Optional[str] = None) -> int:
+    backends = _resolve_backends(name_filter)
+    for b in backends:
+        _revert_one(b)
+    return 0
 
 
 if __name__ == "__main__":
-    if "--revert" in sys.argv:
-        revert()
-    else:
-        install()
+    args = sys.argv[1:]
+    if "--revert" in args:
+        args.remove("--revert")
+        target = args[0] if args else None
+        sys.exit(revert(target))
+    # `--backend X` or positional X both work
+    target = None
+    if "--backend" in args:
+        i = args.index("--backend")
+        target = args[i + 1] if i + 1 < len(args) else None
+    elif args:
+        target = args[0]
+    sys.exit(install(target))
