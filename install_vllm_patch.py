@@ -107,7 +107,7 @@ IMPORT_BLOCK = '''
 # extensions at import time conflicts with Triton/FlashAttention on GB10.
 # Only import the pure-Python vllm_patch module (no CUDA kernels).
 #
-# Two flags written to ~/logs/:
+# Three flags written to ~/logs/:
 #   manthanquant_loaded.flag — appended at file import (this block).
 #       Proves the patched backend file was IMPORTED. vLLM imports
 #       backends during registration scan even when it ultimately picks
@@ -115,10 +115,20 @@ IMPORT_BLOCK = '''
 #       compression is running.
 #   manthanquant_active.flag — appended on FIRST KV-cache hook fire.
 #       Proves at least one forward pass routed through this backend AND
-#       the hook executed. This is the honest "manthanquant is running"
-#       signal.
+#       the hook executed.
+#   manthanquant_skip.flag — appended when our hook intentionally skips
+#       (warmup phase, exception paths). Helps distinguish "never ran" from
+#       "ran but bypassed" while debugging.
+#
+# Skip protocol: we ignore the first MANTHANQUANT_HOOK_SKIP forward/KV
+# calls so vLLM's profiling/warmup can't poison _pending_kv state. The
+# count is per-process, gated by a mutable cell. After the threshold,
+# normal hook behavior resumes. This avoids a class of bugs where small
+# warmup tensors get queued with shapes that don't match real-inference
+# shapes downstream.
 _MQ_ACTIVE = False
-_MQ_FIRST_HOOK = [True]  # mutable cell — gated first-fire flag write
+_MQ_FIRST_HOOK = [True]      # one-shot first-fire flag write
+_MQ_SKIP_REMAINING = [5]     # decrement to 0; while >0 the hook is a no-op
 try:
     import manthanquant.vllm_patch as _mq_patch
     _MQ_ACTIVE = True
@@ -134,26 +144,44 @@ except ImportError:
 
 # KV update hook — fires after each backend's reshape_and_cache_flash call.
 # First fire writes to manthanquant_active.flag (honest activation signal).
+#
+# Defensive design notes:
+# - Wrapped in try/except to guarantee a hook failure can never break
+#   vLLM's scheduler (silent on failure).
+# - Skips the first _MQ_SKIP_REMAINING calls so warmup batches can't
+#   poison _pending_kv with shapes/strides that differ from real inference.
 
 KV_UPDATE_HOOK = '''
         # ManthanQuant: queue KV for deferred compression
         if _MQ_ACTIVE:
-            if _MQ_FIRST_HOOK[0]:
-                _MQ_FIRST_HOOK[0] = False
-                try:
-                    with open(_mq_os.path.join(_mq_logdir, "manthanquant_active.flag"), "a") as _mq_f:
-                        _mq_f.write("kv_hook_first " + __name__ + " pid=" + str(_mq_os.getpid()) + "\\n")
-                except Exception:
-                    pass
-            _mq_patch._patched_kv_hook(self, layer, key, value, kv_cache, slot_mapping)
+            try:
+                if _MQ_SKIP_REMAINING[0] > 0:
+                    _MQ_SKIP_REMAINING[0] -= 1
+                else:
+                    if _MQ_FIRST_HOOK[0]:
+                        _MQ_FIRST_HOOK[0] = False
+                        try:
+                            with open(_mq_os.path.join(_mq_logdir, "manthanquant_active.flag"), "a") as _mq_f:
+                                _mq_f.write("kv_hook_first " + __name__ + " pid=" + str(_mq_os.getpid()) + "\\n")
+                        except Exception:
+                            pass
+                    _mq_patch._patched_kv_hook(self, layer, key, value, kv_cache, slot_mapping)
+            except Exception:
+                pass  # Never let a hook failure propagate into vLLM
 '''
 
+# Forward pre-hook — fires at the start of forward(). Same defensive wrapping.
 FORWARD_PRE_HOOK = '''
         # ManthanQuant: intercept decode for fused compressed attention
         if _MQ_ACTIVE and attn_metadata is not None:
-            _mq_result = _mq_patch._patched_forward_hook(
-                self, layer, query, key, value, kv_cache,
-                attn_metadata, output, output_scale, output_block_scale)
+            _mq_result = None
+            try:
+                if _MQ_SKIP_REMAINING[0] <= 0:
+                    _mq_result = _mq_patch._patched_forward_hook(
+                        self, layer, query, key, value, kv_cache,
+                        attn_metadata, output, output_scale, output_block_scale)
+            except Exception:
+                _mq_result = None  # Never let a hook failure propagate
             if _mq_result is not None:
                 return _mq_result
 '''
