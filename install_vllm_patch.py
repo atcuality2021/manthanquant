@@ -5,21 +5,26 @@ Modifies the installed vLLM source to call ManthanQuant hooks in
 do_kv_cache_update() and forward(). Works in ALL processes because the
 code is in the actual source file (not monkey-patching).
 
-Supported backends (auto-detected, only patched if the file exists):
-  - flash_attn   (FlashAttentionImpl)        — historical, used by ASR/Whisper
-  - triton_attn  (TritonAttentionImpl)       — gemma-4-* on GB10 (sm_121)
-  - flashinfer   (FlashInferImpl)            — Qwen3.5-* on GB10
+Supported backends (only patched if the file exists):
+  - flash_attn   (FlashAttentionImpl)   — default — historical, ASR/Whisper
+  - triton_attn  (TritonAttentionImpl)  — default — gemma-4-* on GB10 (sm_121)
+  - flashinfer   (FlashInferImpl)       — EXPERIMENTAL, opt-in only.
+      The hook fires correctly (active.flag confirms), but on
+      Qwen3.5-122B-A10B-GPTQ-Int4 with speculative decoding
+      (qwen3_5_mtp / mtp), patched flashinfer hangs chat completions
+      indefinitely. Until that's diagnosed, default install skips it.
 
 vLLM picks the backend per model based on architecture compatibility (e.g.
 gemma-4 hard-forces TRITON_ATTN at config.py:104 due to heterogeneous head
-dims). Patching all three backends ensures the manthanquant hooks fire
-regardless of vLLM's choice.
+dims).
 
 Usage:
-    ~/vllm-env/bin/python3 install_vllm_patch.py                    # patch all
-    ~/vllm-env/bin/python3 install_vllm_patch.py --backend triton_attn
-    ~/vllm-env/bin/python3 install_vllm_patch.py --revert           # revert all
-    ~/vllm-env/bin/python3 install_vllm_patch.py --revert flash_attn
+    ~/vllm-env/bin/python3 install_vllm_patch.py                    # patch defaults (flash_attn + triton_attn)
+    ~/vllm-env/bin/python3 install_vllm_patch.py all                # patch ALL backends incl. experimental
+    ~/vllm-env/bin/python3 install_vllm_patch.py --backend flashinfer  # opt in to a specific backend
+    ~/vllm-env/bin/python3 install_vllm_patch.py --revert           # revert defaults
+    ~/vllm-env/bin/python3 install_vllm_patch.py --revert flashinfer
+    ~/vllm-env/bin/python3 install_vllm_patch.py --revert all       # revert ALL
 
 Hooks:
 1. KV hook after reshape_and_cache_flash()/triton_reshape_and_cache_flash()
@@ -63,12 +68,14 @@ BACKENDS = [
         "filename": "flash_attn.py",
         "class_name": "FlashAttentionImpl",
         "kv_marker": "        reshape_and_cache_flash(",
+        "default": True,
     },
     {
         "name": "triton_attn",
         "filename": "triton_attn.py",
         "class_name": "TritonAttentionImpl",
         "kv_marker": "        triton_reshape_and_cache_flash(",
+        "default": True,
     },
     {
         "name": "flashinfer",
@@ -78,6 +85,13 @@ BACKENDS = [
         # — 12-space indent. Hook fires only when KV is actually written
         # (skipping KV-sharing layers that reuse another layer's cache).
         "kv_marker": "            torch.ops._C_cache_ops.reshape_and_cache_flash(",
+        # EXPERIMENTAL — verified the hook FIRES (active.flag confirms), but
+        # chat completions hang on Qwen3.5-122B-A10B-GPTQ-Int4 with the patch
+        # active (2026-04-27 testing on llm3). Root cause likely involves the
+        # KV layout differences in FlashInfer paged cache and/or speculative
+        # decoding (qwen3_5_mtp). Opt-in only via `--backend flashinfer` until
+        # a fix lands.
+        "default": False,
     },
 ]
 
@@ -291,6 +305,10 @@ def _revert_one(backend: dict) -> bool:
 
 def _resolve_backends(name_filter: Optional[str]) -> list[dict]:
     if not name_filter:
+        # Default install only patches backends marked default=True.
+        # Use `--backend flashinfer` to opt in to experimental ones.
+        return [b for b in BACKENDS if b.get("default", True)]
+    if name_filter == "all":
         return BACKENDS
     matches = [b for b in BACKENDS if b["name"] == name_filter]
     if not matches:
@@ -310,7 +328,18 @@ def install(name_filter: Optional[str] = None) -> int:
 
 
 def revert(name_filter: Optional[str] = None) -> int:
-    backends = _resolve_backends(name_filter)
+    # Revert touches every backend that has a .manthanquant_orig backup,
+    # regardless of `default` flag — opt-in installs need a way out.
+    if not name_filter:
+        backends = BACKENDS
+    elif name_filter == "all":
+        backends = BACKENDS
+    else:
+        matches = [b for b in BACKENDS if b["name"] == name_filter]
+        if not matches:
+            valid = ", ".join(b["name"] for b in BACKENDS)
+            sys.exit(f"unknown backend {name_filter!r}; valid: {valid}")
+        backends = matches
     for b in backends:
         _revert_one(b)
     return 0
