@@ -5,24 +5,26 @@ Modifies the installed vLLM source to call ManthanQuant hooks in
 do_kv_cache_update() and forward(). Works in ALL processes because the
 code is in the actual source file (not monkey-patching).
 
-Supported backends (only patched if the file exists, all default-on):
-  - flash_attn   (FlashAttentionImpl)   — historical, ASR/Whisper-class.
-  - triton_attn  (TritonAttentionImpl)  — gemma-4-* on GB10 (sm_121).
-  - flashinfer   (FlashInferImpl)       — Qwen3.5-122B-A10B on GB10.
-      Verified 2026-04-27: hook fires + 5.12× compression on Qwen3.5
-      with speculative decoding (qwen3_5_mtp / mtp). Earlier hang issue
-      was fixed by the defensive try/except + _MQ_SKIP_REMAINING
-      warmup-skip in the IMPORT_BLOCK.
+Supported backends (only patched if the file exists):
+  - flash_attn   (FlashAttentionImpl)   — default — historical, ASR/Whisper
+  - triton_attn  (TritonAttentionImpl)  — default — gemma-4-* on GB10 (sm_121)
+  - flashinfer   (FlashInferImpl)       — EXPERIMENTAL, opt-in only.
+      The hook fires correctly (active.flag confirms), but on
+      Qwen3.5-122B-A10B-GPTQ-Int4 with speculative decoding
+      (qwen3_5_mtp / mtp), patched flashinfer hangs chat completions
+      indefinitely. Until that's diagnosed, default install skips it.
 
 vLLM picks the backend per model based on architecture compatibility (e.g.
 gemma-4 hard-forces TRITON_ATTN at config.py:104 due to heterogeneous head
 dims).
 
 Usage:
-    ~/vllm-env/bin/python3 install_vllm_patch.py                    # patch all default backends
-    ~/vllm-env/bin/python3 install_vllm_patch.py --backend triton_attn  # opt in to one specific backend
-    ~/vllm-env/bin/python3 install_vllm_patch.py --revert           # revert all
+    ~/vllm-env/bin/python3 install_vllm_patch.py                    # patch defaults (flash_attn + triton_attn)
+    ~/vllm-env/bin/python3 install_vllm_patch.py all                # patch ALL backends incl. experimental
+    ~/vllm-env/bin/python3 install_vllm_patch.py --backend flashinfer  # opt in to a specific backend
+    ~/vllm-env/bin/python3 install_vllm_patch.py --revert           # revert defaults
     ~/vllm-env/bin/python3 install_vllm_patch.py --revert flashinfer
+    ~/vllm-env/bin/python3 install_vllm_patch.py --revert all       # revert ALL
 
 Hooks:
 1. KV hook after reshape_and_cache_flash()/triton_reshape_and_cache_flash()
@@ -66,6 +68,12 @@ BACKENDS = [
         "filename": "flash_attn.py",
         "class_name": "FlashAttentionImpl",
         "kv_marker": "        reshape_and_cache_flash(",
+        # Pre-hook anchor: inserted just BEFORE this line in forward(). Must be
+        # a stable statement near the top of forward(), AFTER the profiling
+        # `if attn_metadata is None: return` guard (so attn_metadata is non-None,
+        # matching the hook's own guard). Was "assert output is not None"
+        # (removed upstream); vLLM 0.22.1 uses the line below in both backends.
+        "fwd_anchor": "num_actual_tokens = attn_metadata.num_actual_tokens",
         "default": True,
     },
     {
@@ -73,6 +81,7 @@ BACKENDS = [
         "filename": "triton_attn.py",
         "class_name": "TritonAttentionImpl",
         "kv_marker": "        triton_reshape_and_cache_flash(",
+        "fwd_anchor": "num_actual_tokens = attn_metadata.num_actual_tokens",
         "default": True,
     },
     {
@@ -83,11 +92,14 @@ BACKENDS = [
         # — 12-space indent. Hook fires only when KV is actually written
         # (skipping KV-sharing layers that reuse another layer's cache).
         "kv_marker": "            torch.ops._C_cache_ops.reshape_and_cache_flash(",
-        # Verified 2026-04-27 on llm3 / Qwen3.5-122B-A10B-GPTQ-Int4:
-        # 5.12× compression, 13 layers hooked, sanity prompts coherent
-        # (no hang). Initial hang issue resolved by the defensive
-        # try/except + _MQ_SKIP_REMAINING warmup-skip in IMPORT_BLOCK.
-        "default": True,
+        "fwd_anchor": "num_actual_tokens = attn_metadata.num_actual_tokens",
+        # EXPERIMENTAL — verified the hook FIRES (active.flag confirms), but
+        # chat completions hang on Qwen3.5-122B-A10B-GPTQ-Int4 with the patch
+        # active (2026-04-27 testing on llm3). Root cause likely involves the
+        # KV layout differences in FlashInfer paged cache and/or speculative
+        # decoding (qwen3_5_mtp). Opt-in only via `--backend flashinfer` until
+        # a fix lands.
+        "default": False,
     },
 ]
 
@@ -262,20 +274,22 @@ def _install_one(backend: dict) -> bool:
 
     lines = content_joined.split("\n")
 
-    # ── 3. Insert FORWARD_PRE_HOOK just before the forward()'s first ──────
-    # 'assert output is not None' line inside the impl class. All three
-    # backends use this identical anchor at the top of forward().
+    # ── 3. Insert FORWARD_PRE_HOOK just before the backend's fwd_anchor ───
+    # line inside the impl class (see fwd_anchor in the BACKENDS registry).
+    # The anchor sits at the top of forward() after the profiling guard, so
+    # the hook runs with attn_metadata guaranteed non-None.
+    fwd_anchor = backend["fwd_anchor"]
     in_impl = False
     inserted_pre = False
     for i, line in enumerate(lines):
         if f"class {class_name}" in line:
             in_impl = True
-        if in_impl and "assert output is not None" in line:
+        if in_impl and fwd_anchor in line:
             lines = lines[:i] + FORWARD_PRE_HOOK.split("\n") + lines[i:]
             inserted_pre = True
             break
     if not inserted_pre:
-        print(f"[{name}] WARNING — forward() anchor not found; skipping pre-hook")
+        print(f"[{name}] WARNING — forward() anchor {fwd_anchor!r} not found; skipping pre-hook")
 
     # ── 4. Forward post-hook intentionally skipped on GB10 (see comment above)
 
