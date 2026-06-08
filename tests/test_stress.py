@@ -17,8 +17,8 @@ import json, time, sys, os
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VLLM_KEY = "mk-86cd7b93f21554926b037db58e61a3c5b58831b7111230dfbcd2a3e31c4e4f8f"
-URL = "http://192.168.29.113:8100/v1/chat/completions"
+VLLM_KEY = os.environ.get("VLLM_KEY", "")  # export VLLM_KEY=... before running
+URL = os.environ.get("VLLM_URL", "http://192.168.29.113:8100/v1/chat/completions")
 
 stats = {
     "total_requests": 0,

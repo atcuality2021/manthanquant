@@ -50,9 +50,20 @@ import py_compile
 import glob
 from typing import Optional
 
-VLLM_ENV = os.path.expanduser("~/vllm-env")
+# Target venv: override with VLLM_ENV to patch a non-default env, e.g. the
+# from-source MTP build at ~/vllm-mtp-env:
+#   VLLM_ENV=~/vllm-mtp-env python3 install_vllm_patch.py all
+VLLM_ENV = os.path.expanduser(os.environ.get("VLLM_ENV", "~/vllm-env"))
+
+
+def _site_packages(venv: str) -> str:
+    """Resolve the site-packages dir without hardcoding the Python minor."""
+    hits = sorted(glob.glob(os.path.join(venv, "lib", "python3.*", "site-packages")))
+    return hits[0] if hits else os.path.join(venv, "lib", "python3.12", "site-packages")
+
+
 BACKENDS_DIR = os.path.join(
-    VLLM_ENV, "lib/python3.12/site-packages/vllm/v1/attention/backends"
+    _site_packages(VLLM_ENV), "vllm/v1/attention/backends"
 )
 
 

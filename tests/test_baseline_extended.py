@@ -5,12 +5,12 @@ Covers: TTFT, TGS at varying context, concurrent scaling, long generation,
 KV cache pressure, prefix cache behavior.
 """
 
-import json, time, sys, numpy as np
+import json, time, sys, os, numpy as np
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VLLM_KEY = "mk-86cd7b93f21554926b037db58e61a3c5b58831b7111230dfbcd2a3e31c4e4f8f"
-URL = "http://192.168.29.113:8100/v1/chat/completions"
+VLLM_KEY = os.environ.get("VLLM_KEY", "")  # export VLLM_KEY=... before running
+URL = os.environ.get("VLLM_URL", "http://192.168.29.113:8100/v1/chat/completions")
 
 def call(msgs, max_tokens=500, stream=False):
     payload = {"model":"Qwen3.5-35B-A3B","messages":msgs,"max_tokens":max_tokens,"temperature":0}
