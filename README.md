@@ -289,16 +289,43 @@ GPU tensor (bf16) -> .float().cpu().numpy() -> Lloyd-Max encode -> numpy arrays
 
 - **Compressed decode**: The shadow cache exists but is not used for actual attention computation. All attention still goes through vLLM's standard bf16 FlashAttention path.
 
-- **Memory savings**: The shadow cache runs alongside the standard bf16 paged KV cache. No memory is freed yet -- this is the foundation for hot/cold LRU eviction.
+- **Memory savings**: The shadow cache runs alongside the standard bf16 paged KV cache. No memory is freed yet -- in fact the shadow copy adds memory overhead until eviction ships. The 5.12x is a codec-level result, not a capacity result; hot/cold LRU eviction is what converts it into real capacity.
 
 ## Roadmap
 
-| Version | Status | Description |
-|---------|--------|-------------|
-| v0.3 | **Current** | Shadow cache with 5.12x compression, 25-user concurrency, stress-tested |
-| v0.4 | Next | Hot/cold LRU eviction -- compress idle sessions, free bf16 blocks, decompress on return. Target: 5x more concurrent sessions. |
-| v0.5 | **Done** | x86 discrete GPU support -- [manthanquant-x86](https://github.com/atcuality2021/manthanquant-x86) with CUDA kernels (20x faster), tested on RTX 6000 Blackwell |
-| v1.0 | Planned | Production-ready with compressed decode, memory savings, and multi-GPU support |
+Re-sequenced July 2026. Priority order: realize the memory win first, then harden the integration, then deepen model coupling.
+
+| Version | Status | Priority | Description |
+|---------|--------|----------|-------------|
+| v0.3 | **Current** | -- | Shadow cache with 5.12x compression, 25-user concurrency, stress-tested |
+| v0.5 | **Done** | -- | x86 discrete GPU support -- [manthanquant-x86](https://github.com/atcuality2021/manthanquant-x86) with CUDA kernels (20x faster), tested on RTX 6000 Blackwell |
+| v0.4 | Next | **P1** | Compressed decode + hot/cold LRU eviction -- compress idle sessions, free bf16 blocks, decompress on return. Target: 5x more concurrent sessions. **This is the milestone that turns the codec into product value** -- until it ships, no memory is saved. |
+| v0.6 | Planned | **P2** | Migrate integration from source-patching `flash_attn.py` to vLLM's official **KV Offloading Connector API** (vLLM 0.11+, async, pluggable). See below. |
+| v0.7 | Planned | **P3** | MLA latent compression (shared work with x86 repo; see below) |
+| v0.8 | Planned | **P4** | KV-QAT -- quantization-aware training path (see below) |
+| v1.0 | Planned | -- | Production-ready: compressed decode, real memory savings, multi-GPU |
+
+### P2: From source patch to KV Offloading Connector API
+
+The current `install_vllm_patch.py` edits vLLM source with pinned anchors; git history shows repeated anchor churn tracking vLLM 0.17 → 0.22. The official Connector API (vLLM 0.11+):
+
+- survives vLLM upgrades (stable interface instead of source anchors)
+- is the same interface the Unified-Memory-Aware Tiering mechanism needs -- one integration serves both the 3-bit codec and the tiering layer
+- requires a coexistence decision with LMCache/Mooncake, which occupy the same connector slot: either register ManthanQuant as its own connector, or embed the 3-bit codec as a compression stage inside an LMCache-style tier
+
+### P3: MLA latent compression (critical path for BiltIQ DSM Mechanism 1)
+
+Compressing the MLA latent (rather than full K/V) compounds MLA's ~93% architectural reduction with the 3-bit codec -- this is patent Mechanism 1 in the biltiq-dsm repo, and the hook is currently a stats-only stub in the x86 repo.
+
+Design note: the Lloyd-Max centroids in `cpu_quantize.py` are hard-coded for L2-normalized full K/V vectors mapped to N(0,1). MLA latents have different distributional properties (learned low-rank projections, not raw attention K/V), so the centroids/boundaries likely need re-derivation on measured latent statistics before quality claims transfer.
+
+### P4: KV-QAT -- baking the codec into the model
+
+The endgame for "compressed decode": apply a straight-through-estimator version of the 3-bit quantizer to K/V during training (RDVT distillation stages), so the model learns quantization-tolerant KV distributions. That is what ultimately lets attention read compressed KV directly instead of maintaining a bf16 hot tier. Depends on the biltiq-dsm training pipeline existing; tracked there.
+
+### Ecosystem context (July 2026)
+
+vLLM now ships one-flag **FP8 KV cache** (decode KV cost ~54% of bf16, sub-1% accuracy loss) as the production baseline. ManthanQuant's value proposition is therefore the *additional* ~2.7x beyond FP8 (5.12x vs ~1.9x), plus tiering on unified memory. A head-to-head quality benchmark vs FP8 KV (not just vs bf16) is a required deliverable for v0.4.
 
 ## Tested On
 
